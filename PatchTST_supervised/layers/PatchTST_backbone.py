@@ -12,9 +12,18 @@ import numpy as np
 from layers.PatchTST_layers import *
 from layers.RevIN import RevIN
 
+from kymatio.torch import Scattering1D
+
 # Cell
 class PatchTST_backbone(nn.Module):
-    def __init__(self, c_in:int, context_window:int, target_window:int, patch_len:int, stride:int, max_seq_len:Optional[int]=1024, 
+    """
+    Replaced patch_len and stride with J and Q for Scattering
+    J - number of scales
+    Q - number of wavelets per scale
+    J+ -> smaller 'patch_len'
+    J+ Q+ -> larger 'patch_num'
+    """
+    def __init__(self, c_in:int, context_window:int, target_window:int, J:int, Q:int, max_seq_len:Optional[int]=1024, 
                  n_layers:int=3, d_model=128, n_heads=16, d_k:Optional[int]=None, d_v:Optional[int]=None,
                  d_ff:int=256, norm:str='BatchNorm', attn_dropout:float=0., dropout:float=0., act:str="gelu", key_padding_mask:bool='auto',
                  padding_var:Optional[int]=None, attn_mask:Optional[Tensor]=None, res_attention:bool=True, pre_norm:bool=False, store_attn:bool=False,
@@ -28,14 +37,22 @@ class PatchTST_backbone(nn.Module):
         self.revin = revin
         if self.revin: self.revin_layer = RevIN(c_in, affine=affine, subtract_last=subtract_last)
         
-        # Patching
-        self.patch_len = patch_len
-        self.stride = stride
-        self.padding_patch = padding_patch
-        patch_num = int((context_window - patch_len)/stride + 1)
-        if padding_patch == 'end': # can be modified to general case
-            self.padding_patch_layer = nn.ReplicationPad1d((0, stride)) 
-            patch_num += 1
+        # # Patching
+        # self.patch_len = patch_len
+        # self.stride = stride
+        # self.padding_patch = padding_patch
+        # patch_num = int((context_window - patch_len)/stride + 1)
+        # if padding_patch == 'end': # can be modified to general case
+        #     self.padding_patch_layer = nn.ReplicationPad1d((0, stride)) 
+        #     patch_num += 1
+        
+        # Scattering
+        # Try J = 3, Q = 8
+        self.scattering = Scattering1D(J=J, Q=Q, shape=context_window)
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, context_window)
+            s_dummy = self.scattering(dummy_input)
+        _, patch_num, patch_len = s_dummy.shape
         
         # Backbone 
         self.backbone = TSTiEncoder(c_in, patch_num=patch_num, patch_len=patch_len, max_seq_len=max_seq_len,
@@ -64,11 +81,20 @@ class PatchTST_backbone(nn.Module):
             z = self.revin_layer(z, 'norm')
             z = z.permute(0,2,1)
             
-        # do patching
-        if self.padding_patch == 'end':
-            z = self.padding_patch_layer(z)
-        z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
-        z = z.permute(0,1,3,2)                                                              # z: [bs x nvars x patch_len x patch_num]
+        # # do patching
+        # if self.padding_patch == 'end':
+        #     z = self.padding_patch_layer(z)
+        # z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
+        # z = z.permute(0,1,3,2)                                                              # z: [bs x nvars x patch_len x patch_num]
+        
+        # do scattering
+        s_out = []
+        for d in range(z.shape[1]):
+            z_d = z[:,d,:]                                                         # z_d: [bs x seq_len]
+            s_d = self.scattering(z_d)                                             # s_d: [bs x 'patch_num' x 'patch_len']
+            s_out.append(s_d)
+        s_out = torch.cat(s_out, dim=1)                                            # s_out: [bs x nvars x patch_num x patch_len]
+        z = s_out.permute(0,1,3,2)                                                 # z: [bs x nvars x patch_len x patch_num]
         
         # model
         z = self.backbone(z)                                                                # z: [bs x nvars x d_model x patch_num]
